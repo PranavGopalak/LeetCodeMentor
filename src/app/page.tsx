@@ -288,6 +288,10 @@ export default function Home() {
     if (!aiSchedule || sessions.length === 0) return;
 
     const preferenceSignature = `${targetReviewProblems}:${targetNewProblems}:${JSON.stringify(powerLevels)}`;
+    if (aiSchedule.preferenceSignature === preferenceSignature) {
+      lastPreferenceSyncRef.current = preferenceSignature;
+      return;
+    }
     if (lastPreferenceSyncRef.current === preferenceSignature) return;
 
     lastPreferenceSyncRef.current = preferenceSignature;

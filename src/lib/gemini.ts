@@ -9,6 +9,7 @@ import {
 } from "@/store/useSessionStore";
 import {
   CANONICAL_TAGS,
+  getLedger,
   getSystemState,
   POPULAR_PROBLEMS_BY_TAG,
   toProblemId,
@@ -253,6 +254,55 @@ function selectReviewProblems(
     }
   }
 
+  if (selected.length < targetReview) {
+    const fallbackCandidates = [...getLedger()]
+      .map((entry) => {
+        const canonical = CANONICAL_PROBLEM_LOOKUP.get(entry.id);
+        const sessionsSinceReview = Math.max(
+          0,
+          completedSessions - entry.lastReviewedSession
+        );
+        const interval = Math.max(1, entry.currentInterval || 1);
+        const sessionsUntilDue = Math.max(
+          0,
+          entry.nextReviewSession - completedSessions
+        );
+        const sessionsOverdue = Math.max(
+          0,
+          completedSessions - entry.nextReviewSession
+        );
+        const urgency =
+          sessionsOverdue * 3 +
+          sessionsSinceReview / interval +
+          (5 - Math.max(1, Math.min(4, entry.lastScore || 3))) * 0.8 +
+          (entry.lastScore <= 2 ? 2.2 : 0) +
+          Math.max(0, 2 - sessionsUntilDue) * 0.75 +
+          getProblemFocusBias(canonical?.tags || entry.tags || [], powerLevels);
+
+        return {
+          id: entry.id,
+          name: entry.name,
+          difficulty: canonical?.problem.difficulty || "Medium",
+          tags: canonical?.tags || entry.tags || [],
+          urgency,
+        };
+      })
+      .sort((a, b) => b.urgency - a.urgency);
+
+    for (const candidate of fallbackCandidates) {
+      if (selected.length >= targetReview) break;
+      if (selectedIds.has(candidate.id)) continue;
+
+      selected.push({
+        id: candidate.id,
+        name: candidate.name,
+        difficulty: candidate.difficulty,
+        tags: candidate.tags,
+      });
+      selectedIds.add(candidate.id);
+    }
+  }
+
   return selected;
 }
 
@@ -377,6 +427,7 @@ export async function generateSchedule(
   powerLevels: TagPowerLevels = DEFAULT_POWER_LEVELS
 ): Promise<AISchedule> {
   void leetcodeStats;
+  const preferenceSignature = `${targetReview}:${targetNew}:${JSON.stringify(powerLevels)}`;
 
   const existingIds = new Set<string>();
   const reviewProblems = selectReviewProblems(
@@ -415,6 +466,7 @@ export async function generateSchedule(
     newProblems,
     challengeProblem: null,
     tips,
+    preferenceSignature,
   };
 }
 
@@ -436,7 +488,9 @@ export async function generateOneProblem(
       recentSessions.length,
       powerLevels
     );
-    if (!problem) throw new Error("No review problem is available right now.");
+    if (!problem) {
+      throw new Error("All tracked review candidates are already on the schedule.");
+    }
     return problem;
   }
 

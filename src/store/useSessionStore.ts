@@ -30,6 +30,7 @@ export interface AISchedule {
   newProblems: ScheduledProblem[];
   challengeProblem: ScheduledProblem | null;
   tips: string;
+  preferenceSignature?: string;
 }
 
 export type TagPowerLevels = Record<CanonicalTag, number>;
