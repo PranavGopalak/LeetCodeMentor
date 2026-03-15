@@ -7,6 +7,7 @@ const DATA_DIR = path.join(process.cwd(), 'data', 'store');
 const META_FILE = path.join(DATA_DIR, 'meta.json');
 const SESSION_DIR = path.join(DATA_DIR, 'sessions');
 const ACTIVE_SESSION_FILE = path.join(DATA_DIR, 'active-session.json');
+const SESSION_BACKUP_FILE = path.join(DATA_DIR, 'sessions-backup.json');
 const LEGACY_FILE = path.join(process.cwd(), 'data', 'store.json');
 const LEGACY_ARCHIVE_FILE = path.join(process.cwd(), 'data', 'store.json.legacy');
 
@@ -52,6 +53,11 @@ interface SessionShardFile {
 interface ActiveSessionFile {
   schema: 'leetmentor.store.active-session.v1';
   activeSession: SessionProblemRecord[];
+}
+
+interface SessionBackupFile {
+  schema: 'leetmentor.store.sessions-backup.v1';
+  sessions: SessionRecord[];
 }
 
 const DEFAULT_STATE: PersistedStoreState = {
@@ -253,6 +259,27 @@ async function ensureLayout() {
     };
     await fs.writeFile(ACTIVE_SESSION_FILE, JSON.stringify(activeSession, null, 2), 'utf-8');
   }
+
+  try {
+    await fs.access(SESSION_BACKUP_FILE);
+  } catch {
+    const backup: SessionBackupFile = {
+      schema: 'leetmentor.store.sessions-backup.v1',
+      sessions: [],
+    };
+    await fs.writeFile(SESSION_BACKUP_FILE, JSON.stringify(backup, null, 2), 'utf-8');
+  }
+}
+
+async function writeSessionBackup(sessions: SessionRecord[]): Promise<void> {
+  await ensureLayout();
+  if (sessions.length === 0) return;
+
+  const backup: SessionBackupFile = {
+    schema: 'leetmentor.store.sessions-backup.v1',
+    sessions: sessions.sort((a, b) => b.date.localeCompare(a.date)),
+  };
+  await fs.writeFile(SESSION_BACKUP_FILE, JSON.stringify(backup, null, 2), 'utf-8');
 }
 
 async function writeState(state: PersistedStoreState): Promise<void> {
@@ -277,6 +304,7 @@ async function writeState(state: PersistedStoreState): Promise<void> {
     activeSession: state.activeSession,
   };
   await fs.writeFile(ACTIVE_SESSION_FILE, JSON.stringify(activeSession, null, 2), 'utf-8');
+  await writeSessionBackup(state.sessions);
 
   const shards = new Map<string, SessionRecord[]>();
   for (const session of state.sessions) {
@@ -381,6 +409,23 @@ async function readSessionShards(): Promise<SessionRecord[]> {
   return sessions.sort((a, b) => b.date.localeCompare(a.date));
 }
 
+async function readSessionBackup(): Promise<SessionRecord[]> {
+  await ensureLayout();
+
+  try {
+    const raw = await fs.readFile(SESSION_BACKUP_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<SessionBackupFile>;
+    if (!Array.isArray(parsed.sessions)) return [];
+
+    return parsed.sessions
+      .map(normalizeSession)
+      .filter((session): session is SessionRecord => !!session)
+      .sort((a, b) => b.date.localeCompare(a.date));
+  } catch {
+    return [];
+  }
+}
+
 async function migrateLegacyStore(): Promise<void> {
   await ensureLayout();
   const existingShards = await fs.readdir(SESSION_DIR).catch(() => []);
@@ -420,8 +465,20 @@ async function migrateLegacyStore(): Promise<void> {
 async function readState(): Promise<PersistedStoreState> {
   await migrateLegacyStore();
   const metaState = await readMetaState();
-  const sessions = await readSessionShards();
+  let sessions = await readSessionShards();
   const activeSession = await readActiveSession();
+
+  if (sessions.length === 0) {
+    const backupSessions = await readSessionBackup();
+    if (backupSessions.length > 0) {
+      sessions = backupSessions;
+      await writeState({
+        ...metaState,
+        activeSession,
+        sessions: backupSessions,
+      });
+    }
+  }
 
   return {
     ...metaState,

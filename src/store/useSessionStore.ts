@@ -121,6 +121,22 @@ interface SessionState {
   importData: (json: string) => void;
 }
 
+let hasHydratedStore = false;
+let pendingPersistValue: string | null = null;
+
+async function persistStoreValue(value: string): Promise<void> {
+  try {
+    const parsed = JSON.parse(value);
+    await fetch('/api/store', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(parsed),
+    });
+  } catch {
+    // Silently fail - next mutation can retry.
+  }
+}
+
 // Custom storage adapter: reads/writes to server JSON file via API routes
 const fileStorage: StateStorage = {
   getItem: async (name: string): Promise<string | null> => {
@@ -129,8 +145,6 @@ const fileStorage: StateStorage = {
       const res = await fetch('/api/store');
       if (!res.ok) return null;
       const data = await res.json();
-      // Zustand persist expects the value wrapped in { state: ..., version: ... }
-      // The API stores whatever Zustand gives it, so just return it as a string
       return JSON.stringify({ state: data.state ?? data, version: data.version ?? 0 });
     } catch {
       return null;
@@ -138,16 +152,11 @@ const fileStorage: StateStorage = {
   },
   setItem: async (_name: string, value: string): Promise<void> => {
     void _name;
-    try {
-      const parsed = JSON.parse(value);
-      await fetch('/api/store', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(parsed),
-      });
-    } catch {
-      // Silently fail — data will be retried on next mutation
+    if (!hasHydratedStore) {
+      pendingPersistValue = value;
+      return;
     }
+    await persistStoreValue(value);
   },
   removeItem: async (_name: string): Promise<void> => {
     void _name;
@@ -257,6 +266,15 @@ export const useSessionStore = create<SessionState>()(
               ? state.targetNewProblems
               : 6,
           powerLevels: normalizePowerLevels(state.powerLevels),
+        };
+      },
+      onRehydrateStorage: () => {
+        return () => {
+          hasHydratedStore = true;
+          if (pendingPersistValue) {
+            void persistStoreValue(pendingPersistValue);
+            pendingPersistValue = null;
+          }
         };
       },
     }
