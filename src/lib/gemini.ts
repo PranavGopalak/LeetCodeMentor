@@ -196,6 +196,7 @@ function selectReviewProblems(
   powerLevels: TagPowerLevels
 ): ScheduledProblem[] {
   const state = getSystemState(completedSessions);
+  const ledgerById = new Map(getLedger().map((entry) => [entry.id, entry]));
   const selected: ScheduledProblem[] = [];
   const selectedIds = new Set(existingIds);
   const dueCandidates = [...state.dueProblems].sort((a, b) => {
@@ -223,7 +224,7 @@ function selectReviewProblems(
       id: due.id,
       name: due.name,
       difficulty: canonical?.problem.difficulty || "Medium",
-      tags: canonical?.tags || [],
+      tags: canonical?.tags || ledgerById.get(due.id)?.tags || [],
     });
     selectedIds.add(due.id);
   }
@@ -248,7 +249,7 @@ function selectReviewProblems(
         id: shaky.id,
         name: shaky.name,
         difficulty: canonical?.problem.difficulty || "Medium",
-        tags: canonical?.tags || [],
+        tags: canonical?.tags || ledgerById.get(shaky.id)?.tags || [],
       });
       selectedIds.add(shaky.id);
     }
@@ -527,6 +528,7 @@ export async function gradeSessionProblems(
 
   const prompt = `
     You are a LeetCode mentor. The user has inputted problems they just solved. Their inputs might be messy (e.g. URLs, typos, abbreviations like "2sum").
+    Some of these problems may be random ad-hoc LeetCode problems that were never part of the user's generated schedule. You must still identify and tag them.
 
     For each problem below:
     1. Identify the official LeetCode problem they are referring to.

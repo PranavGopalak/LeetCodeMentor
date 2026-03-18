@@ -60,6 +60,16 @@ interface SessionBackupFile {
   sessions: SessionRecord[];
 }
 
+interface PersistHints {
+  replaceSessions?: boolean;
+  replaceActiveSession?: boolean;
+  replaceLeetcodeUsername?: boolean;
+  replaceGeminiApiKey?: boolean;
+  replaceTargets?: boolean;
+  replacePowerLevels?: boolean;
+  replaceSchedule?: boolean;
+}
+
 const DEFAULT_STATE: PersistedStoreState = {
   leetcodeUsername: '',
   geminiApiKey: '',
@@ -72,6 +82,33 @@ const DEFAULT_STATE: PersistedStoreState = {
   aiSchedule: null,
   sessions: [],
 };
+
+let writeStateChain: Promise<void> = Promise.resolve();
+
+function mergeSessionsById(
+  existing: SessionRecord[],
+  incoming: SessionRecord[]
+): SessionRecord[] {
+  const merged = new Map<string, SessionRecord>();
+
+  for (const session of existing) {
+    merged.set(session.id, session);
+  }
+
+  for (const session of incoming) {
+    merged.set(session.id, session);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function chooseValue<T>(
+  current: T,
+  incoming: T,
+  shouldReplace: boolean
+): T {
+  return shouldReplace ? incoming : current;
+}
 
 function normalizePowerLevels(raw: unknown): Record<CanonicalTag, number> {
   const source = raw && typeof raw === 'object' ? (raw as JsonObject) : {};
@@ -275,6 +312,11 @@ async function writeSessionBackup(sessions: SessionRecord[]): Promise<void> {
   await ensureLayout();
   if (sessions.length === 0) return;
 
+  const existingBackup = await readSessionBackup();
+  if (existingBackup.length > sessions.length) {
+    return;
+  }
+
   const backup: SessionBackupFile = {
     schema: 'leetmentor.store.sessions-backup.v1',
     sessions: sessions.sort((a, b) => b.date.localeCompare(a.date)),
@@ -282,7 +324,7 @@ async function writeSessionBackup(sessions: SessionRecord[]): Promise<void> {
   await fs.writeFile(SESSION_BACKUP_FILE, JSON.stringify(backup, null, 2), 'utf-8');
 }
 
-async function writeState(state: PersistedStoreState): Promise<void> {
+async function writeStateInternal(state: PersistedStoreState): Promise<void> {
   await ensureLayout();
 
   const meta: StoreMetaFile = {
@@ -318,7 +360,13 @@ async function writeState(state: PersistedStoreState): Promise<void> {
   await Promise.all(
     existingFiles
       .filter((file) => file.endsWith('.json'))
-      .map((file) => fs.unlink(path.join(SESSION_DIR, file)))
+      .map((file) =>
+        fs.unlink(path.join(SESSION_DIR, file)).catch((error: NodeJS.ErrnoException) => {
+          if (error?.code !== 'ENOENT') {
+            throw error;
+          }
+        })
+      )
   );
 
   await Promise.all(
@@ -335,6 +383,19 @@ async function writeState(state: PersistedStoreState): Promise<void> {
       );
     })
   );
+}
+
+function writeState(state: PersistedStoreState): Promise<void> {
+  const nextWrite = writeStateChain.then(
+    () => writeStateInternal(state),
+    () => writeStateInternal(state)
+  );
+
+  writeStateChain = nextWrite.catch(() => {
+    // Keep the queue usable after a failed write.
+  });
+
+  return nextWrite;
 }
 
 async function readMetaState(): Promise<Omit<PersistedStoreState, 'sessions'>> {
@@ -390,23 +451,34 @@ async function readActiveSession(): Promise<SessionProblemRecord[]> {
   }
 }
 
-async function readSessionShards(): Promise<SessionRecord[]> {
+async function readSessionShards(): Promise<{
+  sessions: SessionRecord[];
+  hadErrors: boolean;
+}> {
   await ensureLayout();
   const files = await fs.readdir(SESSION_DIR).catch(() => []);
   const sessions: SessionRecord[] = [];
+  let hadErrors = false;
 
   for (const file of files.filter((entry) => entry.endsWith('.json'))) {
-    const raw = await fs.readFile(path.join(SESSION_DIR, file), 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<SessionShardFile>;
-    if (!Array.isArray(parsed.sessions)) continue;
+    try {
+      const raw = await fs.readFile(path.join(SESSION_DIR, file), 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<SessionShardFile>;
+      if (!Array.isArray(parsed.sessions)) continue;
 
-    for (const session of parsed.sessions) {
-      const normalized = normalizeSession(session);
-      if (normalized) sessions.push(normalized);
+      for (const session of parsed.sessions) {
+        const normalized = normalizeSession(session);
+        if (normalized) sessions.push(normalized);
+      }
+    } catch {
+      hadErrors = true;
     }
   }
 
-  return sessions.sort((a, b) => b.date.localeCompare(a.date));
+  return {
+    sessions: sessions.sort((a, b) => b.date.localeCompare(a.date)),
+    hadErrors,
+  };
 }
 
 async function readSessionBackup(): Promise<SessionRecord[]> {
@@ -465,7 +537,8 @@ async function migrateLegacyStore(): Promise<void> {
 async function readState(): Promise<PersistedStoreState> {
   await migrateLegacyStore();
   const metaState = await readMetaState();
-  let sessions = await readSessionShards();
+  const shardResult = await readSessionShards();
+  let sessions = shardResult.sessions;
   const activeSession = await readActiveSession();
 
   if (sessions.length === 0) {
@@ -476,6 +549,17 @@ async function readState(): Promise<PersistedStoreState> {
         ...metaState,
         activeSession,
         sessions: backupSessions,
+      });
+    }
+  } else if (shardResult.hadErrors) {
+    const backupSessions = await readSessionBackup();
+    const mergedSessions = mergeSessionsById(sessions, backupSessions);
+    if (mergedSessions.length > sessions.length) {
+      sessions = mergedSessions;
+      await writeState({
+        ...metaState,
+        activeSession,
+        sessions: mergedSessions,
       });
     }
   }
@@ -500,7 +584,51 @@ export async function POST(request: Request) {
   try {
     const body = (await request.json()) as JsonObject;
     const state = normalizeState((body.state as JsonObject | undefined) ?? body);
-    await writeState(state);
+    const hints: PersistHints = {
+      replaceSessions: body.replaceSessions === true,
+      replaceActiveSession: body.replaceActiveSession === true,
+      replaceLeetcodeUsername: body.replaceLeetcodeUsername === true,
+      replaceGeminiApiKey: body.replaceGeminiApiKey === true,
+      replaceTargets: body.replaceTargets === true,
+      replacePowerLevels: body.replacePowerLevels === true,
+      replaceSchedule: body.replaceSchedule === true,
+    };
+    const currentState = await readState();
+    const sessions = hints.replaceSessions
+      ? state.sessions
+      : mergeSessionsById(currentState.sessions, state.sessions);
+    await writeState({
+      leetcodeUsername: chooseValue(
+        currentState.leetcodeUsername,
+        state.leetcodeUsername,
+        hints.replaceLeetcodeUsername === true
+      ),
+      geminiApiKey: chooseValue(
+        currentState.geminiApiKey,
+        state.geminiApiKey,
+        hints.replaceGeminiApiKey === true
+      ),
+      activeSession: chooseValue(
+        currentState.activeSession,
+        state.activeSession,
+        hints.replaceActiveSession === true
+      ),
+      targetReviewProblems: hints.replaceTargets
+        ? state.targetReviewProblems
+        : currentState.targetReviewProblems,
+      targetNewProblems: hints.replaceTargets
+        ? state.targetNewProblems
+        : currentState.targetNewProblems,
+      powerLevels: hints.replacePowerLevels
+        ? state.powerLevels
+        : currentState.powerLevels,
+      aiSchedule: chooseValue(
+        currentState.aiSchedule,
+        state.aiSchedule,
+        hints.replaceSchedule === true
+      ),
+      sessions,
+    });
     return NextResponse.json({ ok: true });
   } catch (err: unknown) {
     return NextResponse.json(

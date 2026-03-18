@@ -13,20 +13,18 @@ import {
   X,
 } from 'lucide-react';
 import {
+  CANONICAL_TAGS,
   getLedger,
-  getTagCoverage,
   initMastery,
   normalizeTag,
   rebuildMasteryFromSessions,
   toProblemId,
-  type TagCoverage,
 } from '@/lib/mastery';
 
 export default function HistoryPage() {
   const { sessions, removeSession, setAISchedule } = useSessionStore();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [coverage, setCoverage] = useState<TagCoverage[]>([]);
   const [problemTagsById, setProblemTagsById] = useState<Record<string, string[]>>({});
 
   const selectedTagParam = searchParams.get('tag');
@@ -46,7 +44,6 @@ export default function HistoryPage() {
       }
 
       setProblemTagsById(tagsById);
-      setCoverage(getTagCoverage());
     };
 
     loadMastery();
@@ -77,7 +74,20 @@ export default function HistoryPage() {
     0
   );
 
-  const tagLinks = coverage.map((topic) => topic.tag);
+  const tagCounts = CANONICAL_TAGS.map((tag) => {
+    const count = sessions.reduce((sessionCount, session) => {
+      return (
+        sessionCount +
+        session.problems.filter((problem) => {
+          const problemId = toProblemId(problem.id || problem.problemNameOrUrl);
+          const tags = problemTagsById[problemId] || [];
+          return tags.includes(tag);
+        }).length
+      );
+    }, 0);
+
+    return { tag, count };
+  });
 
   const getTagHref = (tag: string) =>
     `${pathname}?tag=${encodeURIComponent(tag)}`;
@@ -115,9 +125,8 @@ export default function HistoryPage() {
               All Problems
             </Link>
 
-            {tagLinks.map((tag) => {
+            {tagCounts.map(({ tag, count }) => {
               const isActive = tag === selectedTag;
-              const topic = coverage.find((item) => item.tag === tag);
               return (
                 <Link
                   key={tag}
@@ -128,7 +137,7 @@ export default function HistoryPage() {
                       : 'border-border bg-background text-foreground/70 hover:border-lc-brand/30 hover:text-lc-brand'
                   }`}
                 >
-                  {tag} {topic ? `(${topic.solved})` : ''}
+                  {tag} ({count})
                 </Link>
               );
             })}

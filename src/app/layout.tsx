@@ -4,6 +4,7 @@ import "./globals.css";
 import Sidebar from "@/components/Sidebar";
 import MobileNav from "@/components/MobileNav";
 import MasteryInit from "@/components/MasteryInit";
+import ApiActivityIndicator from "@/components/ApiActivityIndicator";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,6 +37,7 @@ export default function RootLayout({
           {children}
         </main>
         <MobileNav />
+        <ApiActivityIndicator />
       </body>
     </html>
   );

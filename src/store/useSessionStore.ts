@@ -122,20 +122,96 @@ interface SessionState {
   importData: (json: string) => void;
 }
 
+interface PersistHints {
+  replaceSessions: boolean;
+  replaceActiveSession: boolean;
+  replaceLeetcodeUsername: boolean;
+  replaceGeminiApiKey: boolean;
+  replaceTargets: boolean;
+  replacePowerLevels: boolean;
+  replaceSchedule: boolean;
+}
+
+const EMPTY_PERSIST_HINTS: PersistHints = {
+  replaceSessions: false,
+  replaceActiveSession: false,
+  replaceLeetcodeUsername: false,
+  replaceGeminiApiKey: false,
+  replaceTargets: false,
+  replacePowerLevels: false,
+  replaceSchedule: false,
+};
+
 let hasHydratedStore = false;
 let pendingPersistValue: string | null = null;
+let queuedPersistValue: string | null = null;
+let queuedPersistHints: PersistHints = { ...EMPTY_PERSIST_HINTS };
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistChain: Promise<void> = Promise.resolve();
+let nextPersistHints: PersistHints = { ...EMPTY_PERSIST_HINTS };
 
-async function persistStoreValue(value: string): Promise<void> {
+function mergePersistHints(current: PersistHints, incoming: Partial<PersistHints>): PersistHints {
+  return {
+    replaceSessions: current.replaceSessions || incoming.replaceSessions === true,
+    replaceActiveSession:
+      current.replaceActiveSession || incoming.replaceActiveSession === true,
+    replaceLeetcodeUsername:
+      current.replaceLeetcodeUsername || incoming.replaceLeetcodeUsername === true,
+    replaceGeminiApiKey:
+      current.replaceGeminiApiKey || incoming.replaceGeminiApiKey === true,
+    replaceTargets: current.replaceTargets || incoming.replaceTargets === true,
+    replacePowerLevels:
+      current.replacePowerLevels || incoming.replacePowerLevels === true,
+    replaceSchedule: current.replaceSchedule || incoming.replaceSchedule === true,
+  };
+}
+
+function markNextPersistHints(hints: Partial<PersistHints>): void {
+  nextPersistHints = mergePersistHints(nextPersistHints, hints);
+}
+
+async function persistStoreValue(
+  value: string,
+  hints: PersistHints = EMPTY_PERSIST_HINTS
+): Promise<void> {
   try {
     const parsed = JSON.parse(value);
     await fetch('/api/store', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(parsed),
+      body: JSON.stringify({
+        ...(parsed && typeof parsed === 'object' ? parsed : {}),
+        ...hints,
+      }),
     });
   } catch {
     // Silently fail - next mutation can retry.
   }
+}
+
+function schedulePersist(value: string): void {
+  queuedPersistValue = value;
+  queuedPersistHints = mergePersistHints(queuedPersistHints, nextPersistHints);
+  nextPersistHints = { ...EMPTY_PERSIST_HINTS };
+
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const nextValue = queuedPersistValue;
+    const hints = queuedPersistHints;
+    queuedPersistValue = null;
+    queuedPersistHints = { ...EMPTY_PERSIST_HINTS };
+    if (!nextValue) return;
+
+    persistChain = persistChain
+      .then(() => persistStoreValue(nextValue, hints))
+      .catch(() => {
+        // no-op
+      });
+  }, 120);
 }
 
 // Custom storage adapter: reads/writes to server JSON file via API routes
@@ -157,7 +233,7 @@ const fileStorage: StateStorage = {
       pendingPersistValue = value;
       return;
     }
-    await persistStoreValue(value);
+    schedulePersist(value);
   },
   removeItem: async (_name: string): Promise<void> => {
     void _name;
@@ -185,29 +261,53 @@ export const useSessionStore = create<SessionState>()(
       sessions: [],
       aiSchedule: null,
 
-      setLeetcodeUsername: (username) => set({ leetcodeUsername: username }),
-      setGeminiApiKey: (key) => set({ geminiApiKey: key }),
-      setActiveSession: (problems) => set({ activeSession: problems }),
-      setTargetReviewProblems: (count) => set({ targetReviewProblems: count }),
-      setTargetNewProblems: (count) => set({ targetNewProblems: count }),
-      setPowerLevel: (tag, level) =>
+      setLeetcodeUsername: (username) => {
+        markNextPersistHints({ replaceLeetcodeUsername: true });
+        set({ leetcodeUsername: username });
+      },
+      setGeminiApiKey: (key) => {
+        markNextPersistHints({ replaceGeminiApiKey: true });
+        set({ geminiApiKey: key });
+      },
+      setActiveSession: (problems) => {
+        markNextPersistHints({ replaceActiveSession: true });
+        set({ activeSession: problems });
+      },
+      setTargetReviewProblems: (count) => {
+        markNextPersistHints({ replaceTargets: true });
+        set({ targetReviewProblems: count });
+      },
+      setTargetNewProblems: (count) => {
+        markNextPersistHints({ replaceTargets: true });
+        set({ targetNewProblems: count });
+      },
+      setPowerLevel: (tag, level) => {
+        markNextPersistHints({ replacePowerLevels: true });
         set((state) => ({
           powerLevels: {
             ...state.powerLevels,
             [tag]: Math.max(0, Math.min(5, Math.round(level))),
           },
-        })),
-      setPowerLevels: (powerLevels) =>
+        }));
+      },
+      setPowerLevels: (powerLevels) => {
+        markNextPersistHints({ replacePowerLevels: true });
         set(() => ({
           powerLevels: normalizePowerLevels(powerLevels),
-        })),
+        }));
+      },
       addSession: (session) =>
         set((state) => ({ sessions: [session, ...state.sessions] })),
-      removeSession: (id) =>
+      removeSession: (id) => {
+        markNextPersistHints({ replaceSessions: true });
         set((state) => ({
           sessions: state.sessions.filter((s) => s.id !== id),
-        })),
-      setAISchedule: (schedule) => set({ aiSchedule: schedule }),
+        }));
+      },
+      setAISchedule: (schedule) => {
+        markNextPersistHints({ replaceSchedule: true });
+        set({ aiSchedule: schedule });
+      },
       exportData: () => {
         const state = useSessionStore.getState();
         const data = {
@@ -230,6 +330,15 @@ export const useSessionStore = create<SessionState>()(
       importData: (json: string) => {
         try {
           const data = JSON.parse(json);
+          markNextPersistHints({
+            replaceSessions: true,
+            replaceActiveSession: true,
+            replaceLeetcodeUsername: true,
+            replaceGeminiApiKey: true,
+            replaceTargets: true,
+            replacePowerLevels: true,
+            replaceSchedule: true,
+          });
           set({
             leetcodeUsername: data.leetcodeUsername || '',
             sessions: data.sessions || [],
@@ -273,7 +382,7 @@ export const useSessionStore = create<SessionState>()(
         return () => {
           hasHydratedStore = true;
           if (pendingPersistValue) {
-            void persistStoreValue(pendingPersistValue);
+            schedulePersist(pendingPersistValue);
             pendingPersistValue = null;
           }
         };

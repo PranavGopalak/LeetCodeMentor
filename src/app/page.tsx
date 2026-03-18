@@ -36,6 +36,7 @@ import {
   setEntryTags,
   getToday,
   toLocalDateString,
+  toProblemId,
 } from "@/lib/mastery";
 import { useEffect, useRef, useState } from "react";
 import { nanoid } from "nanoid";
@@ -247,10 +248,16 @@ export default function Home() {
       );
       const isScheduleStale =
         !aiSchedule || toLocalDateString(aiSchedule.date) !== getToday();
+      const needsFoundationSchedule =
+        targetNewProblems > 0 && (aiSchedule?.newProblems.length ?? 0) === 0;
+      const needsReviewSchedule =
+        targetReviewProblems > 0 &&
+        hasReviewBase &&
+        (aiSchedule?.reviewProblems.length ?? 0) === 0;
       const shouldRefresh =
         isScheduleStale ||
-        aiSchedule?.newProblems.length === 0 ||
-        (hasReviewBase && aiSchedule?.reviewProblems.length === 0);
+        needsFoundationSchedule ||
+        needsReviewSchedule;
 
       if (!shouldRefresh) return;
 
@@ -432,6 +439,20 @@ export default function Home() {
       if (geminiApiKey) {
         const reviewSessionIndex = sessions.length + 1;
         const graded = await gradeSessionProblems(geminiApiKey, activeSession);
+        const missingTagNames = [...new Set(
+          graded
+            .filter((item) => item.name && item.name !== "Unknown" && item.tags.length === 0)
+            .map((item) => item.name.trim())
+            .filter(Boolean)
+        )];
+        const supplementalTags =
+          missingTagNames.length > 0
+            ? await backfillProblemTags(geminiApiKey, missingTagNames)
+            : {};
+        const supplementalTagsByName = new Map<string, string[]>();
+        for (const [name, tags] of Object.entries(supplementalTags)) {
+          supplementalTagsByName.set(name.toLowerCase().trim(), tags);
+        }
         const gradedBySessionId = new Map(
           graded
             .filter((item) => item.sessionId)
@@ -443,10 +464,16 @@ export default function Home() {
             gradedBySessionId.get(p.id) ||
             graded.find((x, idx) => activeSession.indexOf(p) === idx);
           if (g) {
+            const resolvedName =
+              g.name && g.name !== "Unknown"
+                ? g.name
+                : extractProblemName(p.problemNameOrUrl);
+            const resolvedId =
+              g.id && g.id !== "unknown" ? g.id : toProblemId(resolvedName);
             return {
               ...p,
-              id: g.id && g.id !== 'unknown' ? g.id : p.id, // Fallback if AI hallucinates 'unknown'
-              problemNameOrUrl: g.name,
+              id: resolvedId,
+              problemNameOrUrl: resolvedName,
               score: p.score && p.score !== 3 ? p.score : g.score, // allow manual score override, else AI score
             };
           }
@@ -459,8 +486,24 @@ export default function Home() {
           const g =
             (originalId ? gradedBySessionId.get(originalId) : undefined) ||
             graded.find((x, gradedIdx) => idx === gradedIdx);
-          if (g && g.id !== 'unknown') {
-            updateMastery(g.id, g.name, p.score || g.score, g.tags, reviewSessionIndex);
+          if (g) {
+            const resolvedName =
+              g.name && g.name !== "Unknown"
+                ? g.name
+                : extractProblemName(p.problemNameOrUrl);
+            const resolvedId =
+              g.id && g.id !== "unknown" ? g.id : toProblemId(resolvedName);
+            const resolvedTags =
+              g.tags.length > 0
+                ? g.tags
+                : supplementalTagsByName.get(resolvedName.toLowerCase().trim()) || [];
+            updateMastery(
+              resolvedId,
+              resolvedName,
+              (p.score || g.score) as ConfidenceScore,
+              resolvedTags,
+              reviewSessionIndex
+            );
           }
         });
       } else {
@@ -468,7 +511,9 @@ export default function Home() {
         const reviewSessionIndex = sessions.length + 1;
         finalSession.forEach((p) => {
           const finalScore = p.score || 3;
-          let tags: string[] = [];
+          const safeName = extractProblemName(p.problemNameOrUrl);
+          const safeId = toProblemId(safeName);
+          let tags = getLedger().find((entry) => entry.id === safeId)?.tags || [];
           if (aiSchedule) {
             const allScheduled = [
               ...aiSchedule.reviewProblems,
@@ -478,10 +523,8 @@ export default function Home() {
             const match = allScheduled.find(
               (sp) => extractProblemName(sp.name) === p.problemNameOrUrl
             );
-            if (match?.tags) tags = match.tags;
+            if (match?.tags?.length) tags = match.tags;
           }
-          const safeName = extractProblemName(p.problemNameOrUrl);
-          const safeId = safeName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
           updateMastery(
             safeId,
             safeName,
